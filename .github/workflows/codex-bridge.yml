@@ -1,0 +1,247 @@
+name: Codex bridge
+
+# Watches the official Codex GitHub review (the @codex app, billed to your
+# ChatGPT/Codex plan). When Codex leaves serious feedback on a PR, this posts
+# "@claude fix Codex feedback" using CLAUDE_PR_PAT so Claude pushes a fix to the
+# same PR branch. Codex only flags P0/P1, so any findings are treated as serious.
+#
+# Two ways a fix gets requested:
+#   1. Codex posts a serious (P0/P1 / changes_requested) finding, AND the PR's
+#      effective risk is `simple`/`complex`.
+#   2. A trusted human (OWNER/MEMBER/COLLABORATOR, not a bot) comments
+#      "@claude allow-ai-fix <head-sha>" on the PR conversation -- the active
+#      override for `human-required`/unclassified PRs. This path only fires when
+#      Codex has actually left a serious finding ON THE CURRENT HEAD.
+#
+# Safeguards:
+# - Never merges anything.
+# - Risk = the stricter of the PR body's declared level and a fresh diff
+#   classification run from the DEFAULT-BRANCH classifier (a PR cannot weaken
+#   its own risk).
+# - Opt-in consent is bound to the exact head SHA (a >=7-char prefix), so it
+#   can't carry to a new head and can't be forged via a backdated commit date.
+#   A label is not used because Claude holds issues:write and could self-apply.
+# - Automated fix rounds are capped per PR (MAX_FIX_ROUNDS, default 3) and derived
+#   from marker comments; each head commit is fixed at most once. Past the cap the
+#   bridge escalates to a human instead of looping.
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (trusted classifier source)
+        uses: actions/checkout@v4
+        with:
+          # Pin to the default branch -- NEVER the PR merge ref -- so a PR that
+          # edits classify-risk.sh cannot influence its own risk decision.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      - name: Maybe request a Claude fix
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_PR_PAT }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          # Codex review bot login. Override with repo variable CODEX_BOT_LOGIN if
+          # your installation posts under a different account.
+          CODEX_BOT: ${{ vars.CODEX_BOT_LOGIN }}
+          # Max automated fix rounds per PR before handing to a human (default 3).
+          MAX_FIX_ROUNDS: ${{ vars.MAX_FIX_ROUNDS }}
+          # pull_request_review fields
+          REVIEW_AUTHOR: ${{ github.event.review.user.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          REVIEW_COMMIT: ${{ github.event.review.commit_id }}
+          # PR number for review and review-comment events
+          PR_EVENT_PR: ${{ github.event.pull_request.number }}
+          # comment fields (shared by pull_request_review_comment and issue_comment)
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          # inline review comments carry the commit they were left on
+          COMMENT_COMMIT: ${{ github.event.comment.commit_id }}
+          # issue_comment-on-PR fields
+          ISSUE_COMMENT_PR_URL: ${{ github.event.issue.pull_request.url }}
+          ISSUE_COMMENT_PR: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "CLAUDE_PR_PAT not set; skipping bridge."
+            exit 0
+          fi
+          CODEX_BOT="${CODEX_BOT:-chatgpt-codex-connector[bot]}"
+
+          # Resolve author / body / state / PR number from the triggering event.
+          # pull_request_review_comment is fired per inline diff comment, which is
+          # the path Codex usually takes when it leaves P0/P1 findings as line-level
+          # comments with an empty review summary -- without this case the bridge
+          # never sees those findings.
+          # EVENT_COMMIT = the commit the triggering Codex event was bound to, when the
+          # event carries one (reviews and inline comments do; conversation comments
+          # don't). Used below to reject findings left on a now-stale head.
+          if [ "$EVENT" = "pull_request_review" ]; then
+            AUTHOR="${REVIEW_AUTHOR:-}"
+            BODY="${REVIEW_BODY:-}"
+            STATE="${REVIEW_STATE:-}"
+            PR="${PR_EVENT_PR:-}"
+            EVENT_COMMIT="${REVIEW_COMMIT:-}"
+          elif [ "$EVENT" = "pull_request_review_comment" ]; then
+            AUTHOR="${COMMENT_AUTHOR:-}"
+            BODY="${COMMENT_BODY:-}"
+            STATE=""
+            PR="${PR_EVENT_PR:-}"
+            EVENT_COMMIT="${COMMENT_COMMIT:-}"
+          else
+            if [ -z "${ISSUE_COMMENT_PR_URL:-}" ]; then
+              echo "issue_comment is not on a PR; skipping."
+              exit 0
+            fi
+            AUTHOR="${COMMENT_AUTHOR:-}"
+            BODY="${COMMENT_BODY:-}"
+            STATE=""
+            PR="${ISSUE_COMMENT_PR:-}"
+            EVENT_COMMIT=""
+          fi
+
+          # PR-level context needed by both trigger paths.
+          read -r BASE_SHA HEAD_SHA < <(gh api "repos/$REPO/pulls/$PR" --jq '"\(.base.sha) \(.head.sha)"')
+
+          # Effective risk = stricter of (body-declared) and (fresh diff classification
+          # via the DEFAULT-BRANCH classifier). A hand-edited body can't talk it down.
+          PR_BODY="$(gh pr view "$PR" -R "$REPO" --json body --jq '.body' || true)"
+          BODY_RISK="$(printf '%s' "$PR_BODY" \
+            | grep -ioE 'risk level:[[:space:]]*`?(simple|complex|human-required)`?' \
+            | head -n 1 | grep -ioE '(simple|complex|human-required)' \
+            | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
+          DIFF_RISK="human-required"
+          if [ -f .github/scripts/classify-risk.sh ]; then
+            DIFF_RISK="$(bash .github/scripts/classify-risk.sh "$BASE_SHA" "$HEAD_SHA" || echo human-required)"
+          fi
+          rank() { case "$1" in human-required) echo 3;; complex) echo 2;; simple) echo 1;; *) echo 0;; esac; }
+          if [ "$(rank "$DIFF_RISK")" -ge "$(rank "$BODY_RISK")" ]; then RISK="$DIFF_RISK"; else RISK="$BODY_RISK"; fi
+          echo "Risk: body='${BODY_RISK:-<none>}' diff='$DIFF_RISK' -> effective='$RISK'"
+
+          # Opt-in BOUND TO THE EXACT HEAD COMMIT: a trusted human (OWNER/MEMBER/
+          # COLLABORATOR, not a bot) commented "@claude allow-ai-fix <head-sha>" on the
+          # PR conversation, where <head-sha> is a >=7-char prefix of the current head SHA.
+          # We scan ALL conversation comments (not just the triggering event) so this is
+          # reachable on the human's OWN comment event, not only on a later Codex event.
+          OPT_IN=no
+          # HEAD_SHA is a GitHub-issued hex SHA; safe to embed as a jq literal.
+          OPT_IN_JQ='
+            .[]
+            | select((.author_association=="OWNER" or .author_association=="MEMBER" or .author_association=="COLLABORATOR") and .user.type!="Bot")
+            | ((.body // "") | ascii_downcase) as $b
+            | (($b | capture("@claude[[:space:]]+allow-ai-fix[[:space:]]+(?<sha>[0-9a-f]{7,40})")?) | .sha) as $sha
+            | select($sha != null and ("'"$HEAD_SHA"'" | ascii_downcase | startswith($sha)))
+            | $sha'
+          if gh api "repos/$REPO/issues/$PR/comments" --paginate --jq "$OPT_IN_JQ" | grep -q .; then
+            OPT_IN=yes
+          fi
+
+          # Is the triggering event itself a serious Codex finding?
+          CODEX_SERIOUS=0
+          if [ "$AUTHOR" = "$CODEX_BOT" ]; then
+            STATE="$(printf '%s' "$STATE" | tr '[:upper:]' '[:lower:]')"
+            if [ "$STATE" = "approved" ]; then
+              echo "Codex approved; nothing to fix."
+              exit 0
+            fi
+            # Codex only surfaces P0/P1, so changes_requested or P0/P1 text is serious.
+            if [ "$STATE" = "changes_requested" ] || printf '%s' "$BODY" | grep -iqE '(\bP0\b|\bP1\b|critical|blocker|blocking|changes requested)'; then
+              CODEX_SERIOUS=1
+            fi
+          fi
+
+          # Does Codex have a serious finding ON THE CURRENT HEAD? Reviews and inline
+          # comments carry a commit_id we can bind to HEAD_SHA (issue-comment summaries do
+          # not, so they don't count). This gates the human opt-in path: a human may only
+          # authorize fixing findings that actually exist for this exact commit.
+          codex_flagged_head() {
+            local n
+            n="$( {
+              gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq '
+                [ .[] | select(.user.login=="'"$CODEX_BOT"'" and .commit_id=="'"$HEAD_SHA"'"
+                    and ((.state|ascii_upcase=="CHANGES_REQUESTED") or ((.body//"")|test("\\bP0\\b|\\bP1\\b|critical|blocker|blocking";"i")))) ] | length' 2>/dev/null
+              gh api "repos/$REPO/pulls/$PR/comments" --paginate --jq '
+                [ .[] | select(.user.login=="'"$CODEX_BOT"'" and .commit_id=="'"$HEAD_SHA"'") ] | length' 2>/dev/null
+            } | awk '{s+=$1} END{print s+0}')"
+            [ "${n:-0}" -gt 0 ]
+          }
+
+          # Decide whether to request a fix.
+          if [ "$CODEX_SERIOUS" = "1" ]; then
+            # Bind the finding to the reviewed head: a push landed after Codex reviewed
+            # must not let a stale finding authorize a fix on an unreviewed commit.
+            if [ -n "$EVENT_COMMIT" ]; then
+              if [ "$EVENT_COMMIT" != "$HEAD_SHA" ]; then
+                echo "Codex finding was on ${EVENT_COMMIT:0:12} but current head is ${HEAD_SHA:0:12}; PR advanced, skipping stale finding."
+                exit 0
+              fi
+            elif ! codex_flagged_head; then
+              # Conversation-comment finding can't be bound to a commit; require a fresh
+              # head-bound Codex finding (review / inline comment on the current head).
+              echo "Codex finding not bound to a commit and none found on current head ${HEAD_SHA:0:12}; skipping."
+              exit 0
+            fi
+            case "$RISK" in
+              simple|complex)
+                echo "Serious Codex finding on a '$RISK' PR; will request a fix." ;;
+              *)
+                if [ "$OPT_IN" = "yes" ]; then
+                  echo "Serious Codex finding on '${RISK:-<none>}' PR with a trusted opt-in for head ${HEAD_SHA:0:12}; will request a fix."
+                else
+                  echo "PR #$PR is '${RISK:-<none>}'; deferring to a human (comment '@claude allow-ai-fix ${HEAD_SHA:0:12}' on the PR to permit one automated fix for this exact commit)."
+                  exit 0
+                fi ;;
+            esac
+          elif [ "$OPT_IN" = "yes" ]; then
+            # Human opt-in is the trigger; only honour it if Codex actually flagged this head.
+            if ! codex_flagged_head; then
+              echo "Trusted opt-in present for head ${HEAD_SHA:0:12}, but no serious Codex finding on this head; nothing to fix."
+              exit 0
+            fi
+            echo "Trusted human opt-in for head ${HEAD_SHA:0:12} with an existing Codex finding; will request a fix."
+          else
+            echo "Event author '$AUTHOR' is not Codex and no trusted opt-in matches head ${HEAD_SHA:0:12}; skipping."
+            exit 0
+          fi
+
+          # Loop guard: cap automated fix rounds per PR and never fire twice for the same
+          # head. Rounds are DERIVED from marker comments (no state stored outside GitHub),
+          # the same GitHub-derived-state model as the auto-task dispatcher.
+          MAX_ROUNDS="${MAX_FIX_ROUNDS:-3}"
+          ALL="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[].body' 2>/dev/null || true)"
+          ROUNDS="$(printf '%s' "$ALL" | grep -c 'codex-bridge-fix' || true)"
+
+          # Idempotency: already asked for a fix on THIS exact head? (several Codex inline
+          # comments on one commit must not each start a round).
+          if printf '%s' "$ALL" | grep -q "head=$HEAD_SHA"; then
+            echo "Already requested a fix for head ${HEAD_SHA:0:12}; skipping duplicate."
+            exit 0
+          fi
+
+          # Cap reached -> hand to a human (escalate once) and stop auto-fixing this PR.
+          if [ "${ROUNDS:-0}" -ge "$MAX_ROUNDS" ]; then
+            if ! printf '%s' "$ALL" | grep -q 'codex-bridge-escalated'; then
+              gh pr comment "$PR" -R "$REPO" --body "Automated fix loop hit its cap of $MAX_ROUNDS round(s) and Codex still has findings. Handing this PR to a human; no further automated fixes will be requested. <!-- codex-bridge-escalated -->"
+            fi
+            echo "Fix-round cap ($MAX_ROUNDS) reached on PR #$PR; escalated to a human."
+            exit 0
+          fi
+
+          # Request the next fix round. The @claude line triggers claude.yml; the invisible
+          # HTML marker records the head + round for the counter above.
+          gh pr comment "$PR" -R "$REPO" --body "@claude fix Codex feedback. Address the Codex review comments in this PR, add or update tests if needed, and push the fix to this same PR branch. Do not open a new PR and do not merge. <!-- codex-bridge-fix head=$HEAD_SHA round=$((ROUNDS+1)) -->"
+          echo "Requested Claude fix round $((ROUNDS+1))/$MAX_ROUNDS on PR #$PR (head ${HEAD_SHA:0:12})."

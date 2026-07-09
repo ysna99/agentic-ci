@@ -1,0 +1,119 @@
+name: Claude Code
+
+# Runs Claude Code when "@claude" appears in an issue, an issue/PR comment,
+# or a PR review. Claude implements changes on a branch; a separate step then
+# opens a PR using CLAUDE_PR_PAT so that the pull_request event fires (the
+# default GITHUB_TOKEN would not trigger the risk-label and Codex workflows).
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    # Require "@claude" AND a trusted actor; gates out drive-by non-collaborators.
+    # Exclude "allow-ai-fix": that phrase is the codex-bridge consent signal and must
+    # NOT start Claude directly -- only the bridge may post the vetted "@claude fix..."
+    # after its current-head Codex-finding and loop-guard checks pass.
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+        !contains(github.event.comment.body, 'allow-ai-fix') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') &&
+        !contains(github.event.comment.body, 'allow-ai-fix') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') &&
+        !contains(github.event.review.body, 'allow-ai-fix') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Open a draft PR with a PAT (so the risk-label workflow fires; PRs opened
+      # by the default GITHUB_TOKEN do not trigger other workflows), then ask the
+      # official Codex GitHub app to review via "@codex review" (works even while
+      # the PR is a draft). On a fix run (the PR already exists, e.g. triggered by
+      # the codex-bridge "@claude fix" comment), this re-requests a Codex review
+      # of the new push instead of opening a second PR. The PAT is scoped to this
+      # step only; it never authors commits.
+      - name: Open draft PR or request Codex review
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_PR_PAT }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.claude.outputs.branch_name }}
+          BASE: ${{ github.event.repository.default_branch }}
+          ISSUE_PR_URL: ${{ github.event.issue.pull_request.url }}
+          ISSUE_PR_NUM: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "CLAUDE_PR_PAT is not set; if a branch was pushed, open the PR manually."
+            echo "Add the CLAUDE_PR_PAT secret to enable automatic PR creation."
+            exit 0
+          fi
+
+          # Resolve an existing PR: by Claude's branch, or by the PR this comment is on.
+          PR=""
+          if [ -n "${BRANCH:-}" ] && gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            PR="$(gh pr view "$BRANCH" --json number --jq '.number')"
+          elif [ -n "${ISSUE_PR_URL:-}" ] && [ -n "${ISSUE_PR_NUM:-}" ]; then
+            PR="$ISSUE_PR_NUM"
+          fi
+
+          if [ -n "$PR" ]; then
+            echo "PR #$PR already exists; requesting a fresh Codex review."
+            gh pr comment "$PR" --body "@codex review"
+            exit 0
+          fi
+
+          if [ -z "${BRANCH:-}" ]; then
+            echo "No branch was created and this is not a PR comment; nothing to open."
+            exit 0
+          fi
+
+          TITLE="Claude: ${BRANCH}"
+          # Deterministic risk from the pushed diff (REPO/GH_TOKEN inherited from step env).
+          RISK="$(bash .github/scripts/classify-risk.sh "${BASE:-main}" "$BRANCH")"
+          echo "Computed risk level: $RISK"
+          # Preserve Claude's summary/checks if it wrote a body; else a short intro.
+          if [ -f /tmp/pr_body.md ]; then
+            BODY_SRC="$(cat /tmp/pr_body.md)"
+          else
+            BODY_SRC="Automated draft PR created by Claude Code."
+          fi
+          # Strip any pre-existing "Risk level:" line so ours is authoritative.
+          BODY_SRC="$(printf '%s\n' "$BODY_SRC" | grep -viE '^[[:space:]]*risk level:' || true)"
+          {
+            printf '%s\n' "$BODY_SRC"
+            echo
+            echo "Risk level: ${RISK}"
+            echo
+            echo "_Risk classified deterministically from the diff; the bridge re-verifies from the default-branch classifier before any automated fix._"
+          } > /tmp/pr_body.md
+          URL="$(gh pr create --draft --base "${BASE:-main}" --head "$BRANCH" \
+            --title "$TITLE" --body-file /tmp/pr_body.md)"
+          echo "Opened draft PR: $URL"
+          # Ask the official Codex GitHub app to review (works even while draft).
+          gh pr comment "$URL" --body "@codex review"

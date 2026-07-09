@@ -1,0 +1,49 @@
+name: Auto task dispatcher
+
+# Stateless dispatcher: reads immutable manifests from the default branch
+# (.github/auto-tasks/<slug>/tasks.json) and derives each task's state from
+# issues/PRs every run -- it never writes the manifest or pushes to the
+# protected default branch. Opens the next eligible task as an "@claude" issue
+# via CLAUDE_PR_PAT (so claude.yml fires), one task per merged PR. Never merges.
+# See .github/scripts/dispatch-tasks.sh and .github/auto-tasks/README.md.
+#
+# Start a chain: merge a PR adding .github/auto-tasks/<slug>/tasks.json with
+#   "paused": false (see the split-task skill), or run this workflow manually.
+# Stop: set "paused": true in the manifest, or repo variable AUTO_TASKS_ENABLED=false.
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: auto-task-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (read-only)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      - name: Dispatch next task
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_PR_PAT }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          AUTO_TASKS_ENABLED: ${{ vars.AUTO_TASKS_ENABLED }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "CLAUDE_PR_PAT is not set; cannot open task issues that trigger claude.yml."
+            exit 0
+          fi
+          bash .github/scripts/dispatch-tasks.sh

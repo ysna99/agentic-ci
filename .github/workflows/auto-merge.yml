@@ -1,0 +1,96 @@
+name: Auto-merge (graduated autonomy)
+
+# Closes the loop for LOW-RISK PRs only. Merges a PR automatically when ALL hold:
+#   - effective risk == simple, RECOMPUTED from the default-branch classifier
+#     (a label is NOT trusted: Claude holds pull-requests:write and could self-label)
+#   - the Codex app has APPROVED the current head commit
+#   - every check is green (gh pr checks passes)
+#   - the PR is open, not a draft, and not conflicting
+# complex / human-required PRs are never auto-merged; a human still merges those.
+#
+# OFF BY DEFAULT. Enable with repo variable AUTO_MERGE_ENABLED=true.
+# Prereqs: branch protection on the default branch with your CI (tsc/lint/test) as
+# REQUIRED checks, and the merging identity (CLAUDE_PR_PAT) permitted to merge.
+on:
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to evaluate
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number || github.event.inputs.pr || github.event.check_suite.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  automerge:
+    if: ${{ vars.AUTO_MERGE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (trusted classifier source)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      - name: Evaluate gates and maybe merge
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_PR_PAT }}
+          REPO: ${{ github.repository }}
+          CODEX_BOT: ${{ vars.CODEX_BOT_LOGIN }}
+          EVENT: ${{ github.event_name }}
+          REVIEW_PR: ${{ github.event.pull_request.number }}
+          DISPATCH_PR: ${{ github.event.inputs.pr }}
+          CHECK_SHA: ${{ github.event.check_suite.head_sha }}
+        run: |
+          set -euo pipefail
+          [ -z "${GH_TOKEN:-}" ] && { echo "CLAUDE_PR_PAT not set; skipping."; exit 0; }
+          CODEX_BOT="${CODEX_BOT:-chatgpt-codex-connector[bot]}"
+
+          # Resolve the PR number across the trigger types.
+          PR="${REVIEW_PR:-${DISPATCH_PR:-}}"
+          if [ -z "$PR" ] && [ -n "${CHECK_SHA:-}" ]; then
+            PR="$(gh api "repos/$REPO/commits/$CHECK_SHA/pulls" --jq '.[0].number' 2>/dev/null || true)"
+          fi
+          [ -z "$PR" ] && { echo "No PR to evaluate."; exit 0; }
+
+          # PR must be open, not a draft, not conflicting.
+          read -r STATE DRAFT MERGEABLE HEAD_SHA BASE_SHA < <(gh api "repos/$REPO/pulls/$PR" \
+            --jq '"\(.state) \(.draft) \(.mergeable_state) \(.head.sha) \(.base.sha)"')
+          [ "$STATE" = "open" ]  || { echo "PR #$PR not open ($STATE)."; exit 0; }
+          [ "$DRAFT" = "false" ] || { echo "PR #$PR is a draft."; exit 0; }
+          [ "$MERGEABLE" != "dirty" ] || { echo "PR #$PR has conflicts."; exit 0; }
+
+          # Gate 1: effective risk == simple, recomputed (never label-trusted).
+          PR_BODY="$(gh pr view "$PR" -R "$REPO" --json body --jq '.body' || true)"
+          BODY_RISK="$(printf '%s' "$PR_BODY" \
+            | grep -ioE 'risk level:[[:space:]]*`?(simple|complex|human-required)`?' \
+            | head -1 | grep -ioE '(simple|complex|human-required)' | head -1 | tr '[:upper:]' '[:lower:]' || true)"
+          DIFF_RISK="human-required"
+          [ -f .github/scripts/classify-risk.sh ] && \
+            DIFF_RISK="$(bash .github/scripts/classify-risk.sh "$BASE_SHA" "$HEAD_SHA" || echo human-required)"
+          rank() { case "$1" in human-required) echo 3;; complex) echo 2;; simple) echo 1;; *) echo 0;; esac; }
+          if [ "$(rank "$DIFF_RISK")" -ge "$(rank "$BODY_RISK")" ]; then RISK="$DIFF_RISK"; else RISK="$BODY_RISK"; fi
+          [ "$RISK" = "simple" ] || { echo "PR #$PR risk='$RISK' (not simple); a human merges this."; exit 0; }
+
+          # Gate 2: Codex APPROVED the CURRENT head (stale approvals from before a push don't count).
+          APPROVED="$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq \
+            '[ .[] | select(.user.login=="'"$CODEX_BOT"'" and .commit_id=="'"$HEAD_SHA"'" and (.state|ascii_upcase=="APPROVED")) ] | length')"
+          [ "${APPROVED:-0}" -gt 0 ] || { echo "No Codex approval on head ${HEAD_SHA:0:12}; waiting."; exit 0; }
+
+          # Gate 3: all checks green (gh pr checks exits non-zero on any failing OR pending check).
+          if ! gh pr checks "$PR" -R "$REPO" >/dev/null 2>&1; then
+            echo "Checks not all green on PR #$PR; waiting for CI."; exit 0
+          fi
+
+          echo "PR #$PR: simple + Codex-approved on head ${HEAD_SHA:0:12} + checks green -> merging."
+          gh pr merge "$PR" -R "$REPO" --squash --delete-branch

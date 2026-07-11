@@ -38,17 +38,47 @@ Upgrades classify atomic and touch dependency manifests, so `classify-risk.sh`
 flags them human-required and they never auto-merge. That falls out of the
 existing mechanisms; there is no per-type workflow.
 
-### Out of scope: greenfield ("from scratch")
+### Greenfield ("from scratch"): a separate entry ramp, same engine
 
-Building a project from scratch is NOT covered, and should not be forced into
-this template. It violates the one invariant everything here rests on: there is
-no green main, no load-bearing CI, and no trust boundaries yet, so every gate
-(auto-merge's CI check, risk classification, keep-main-green sequencing) has
-nothing to stand on.
+Building from scratch cannot START on this loop: there is no green main, no
+load-bearing CI, no trust boundaries, so every gate would have nothing to stand
+on. It is not forced in. Instead, `skills/bootstrap-project` is a **phase-0
+bootstrap** whose deliverable is exactly this loop's preconditions:
 
-Treat greenfield as a separate **phase-0 bootstrap** whose deliverable is exactly
-this loop's preconditions: scaffold + CI + `CLAUDE.md` + `sensitive-paths.txt` +
-branch protection. When phase-0 produces those, hand off to this loop.
+    spec -> generator scaffold -> CI + CLAUDE.md + engine copy +
+    sensitive-paths.txt -> branch protection -> verified handoff
+
+The engine files stay byte-identical to this template -- everything
+greenfield-specific is data and skills, the same principle that keeps work-type
+variation out of the workflows. From the first task on, the UNMODIFIED engine
+runs.
+
+Because a new repo has no tests, the non-LLM ground truth is staged in:
+
+| Stage | Non-LLM ground truth                          | Exists when |
+|-------|-----------------------------------------------|-------------|
+| 0     | Human review of every merge + build/lint CI   | first commit (generator scaffolds are green) |
+| 1     | Smoke test in CI (app starts and answers)     | walking-skeleton task merges |
+| 2     | Acceptance tests per feature, criteria frozen in the approved manifest | each feature task |
+| 3     | Full brownfield posture; auto-merge defensible | human flips `AUTO_MERGE_ENABLED` at the checkpoint |
+
+Test discipline: each task's acceptance criteria are enumerated in the
+human-approved manifest (written by `/split-task`'s greenfield strategy from
+`docs/spec.md`), and tests land in the SAME PR as the implementation. Review
+verifies code against human-frozen criteria -- that provenance is what breaks
+the LLM-writes-tests-for-LLM-code circle. Auto-merge stays OFF until a human
+arms it at the stage-3 checkpoint.
+
+Start from scratch:
+
+1. Run `/bootstrap-project` in the new project's directory (interview ->
+   approved `docs/spec.md` -> scaffold with the ecosystem's generator ->
+   CI + CLAUDE.md + engine + boundaries -> push).
+2. `bash bootstrap/protect.sh <owner/repo>` from this repo's checkout; finish
+   its manual checklist (secrets, Codex app); re-run with `--verify` until it
+   prints ALL PRECONDITIONS PASS.
+3. `/split-task docs/spec.md` -> paused manifest -> activate (see the
+   auto-tasks README). Task 1, the walking skeleton, makes CI load-bearing.
 
 ## Apply to a repo
 
@@ -64,8 +94,8 @@ branch protection. When phase-0 produces those, hand off to this loop.
    - `MAX_FIX_ROUNDS` (default 3)
    - `CODEX_BOT_LOGIN` (default `chatgpt-codex-connector[bot]`)
 5. Install the official Codex GitHub review app on the repo.
-6. Install the planning skill: copy `skills/split-task/` to
-   `~/.claude/skills/split-task/`.
+6. Install the skills: copy `skills/split-task/` (and, if you start new
+   projects, `skills/bootstrap-project/`) into `~/.claude/skills/`.
 7. Branch protection on the default branch with CI (build/lint/test) as REQUIRED
    checks, and "Do not allow bypassing the above settings" enabled -- the PAT
    owner is usually an admin, and without it the merge API lets admins past red
@@ -87,6 +117,10 @@ branch protection. When phase-0 produces those, hand off to this loop.
 - `auto/sensitive-paths.txt` -- per-repo trust boundaries (you edit this)
 - `auto-tasks/README.md` -- manifest schema for multi-task work
 - `skills/split-task/` -- planning skill that writes a task manifest
+- `skills/bootstrap-project/` -- phase-0 greenfield bootstrap (spec -> scaffold
+  -> engine -> verified handoff)
+- `bootstrap/protect.sh` -- one-shot arming (branch protection + vars) and
+  verification of the brownfield preconditions; the greenfield handoff gate
 
 ## Security notes
 

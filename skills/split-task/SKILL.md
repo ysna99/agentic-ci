@@ -16,10 +16,23 @@ it (see "Activation" below).
   or the plan in the current conversation (write it to a temp file first if needed).
 - The target repository working tree (where the manifest will be written). Default:
   `KISA-website-client`. If the current directory is not that repo, ask the user for the path.
+- Greenfield: the input is the approved `docs/spec.md` written by `/bootstrap-project`, and the
+  target is the freshly bootstrapped repo (the current directory).
 
 ## Phase 1 — Analyze and classify the strategy
 
 Read the plan and decide how it should be split, using these rules in order:
+
+0. **GREENFIELD** (skeleton-first sequential) when the input is a project spec from
+   `/bootstrap-project` (`docs/spec.md`) for a freshly bootstrapped repo, rather than a change to an
+   existing codebase:
+   - Task 1 is ALWAYS the walking skeleton: the thinnest end-to-end slice (one page renders / one
+     endpoint answers), and its acceptance criteria include wiring the smoke test (start the app,
+     hit it, fail on non-200) as a STEP inside the existing `checks` CI job. That PR touches
+     `.github/` so it self-classifies human-required — expected: it is the moment CI becomes
+     load-bearing, and a human should be looking.
+   - Every later task is one feature slice that leaves `main` green on its own, sequential
+     (`depends_on` the previous slice) unless the spec proves two slices genuinely independent.
 
 1. **ATOMIC** (one coordinated PR) if **either**:
    - splitting the work the natural way would leave `main` in a broken / un-buildable state at any
@@ -90,6 +103,25 @@ Rules for the manifest:
 - Keep `max_tasks` conservative; the dispatcher refuses to exceed it.
 - Avoid sensitive paths unless a task is specifically about them; such PRs are auto-labeled
   `human-required` (the chain still works — it just waits at your merge gate).
+
+GREENFIELD manifests additionally:
+- Each `body` is the feature's enumerated acceptance criteria (a checklist copied from the approved
+  spec) plus `See docs/spec.md#<section>` for context — reference the spec, don't restate it: bodies
+  are echoed into issues, PR bodies, and every fix round, so repetition compounds token cost.
+- Tests land in the SAME PR as the implementation (criteria-in-one-PR is the default). The review
+  question is mechanical: do the tests encode the listed criteria, and does the code pass them?
+  The criteria's human-approved provenance is what breaks the LLM-tests-LLM-code circle.
+  EXCEPTION (opt-in, for genuinely subtle core logic only): a two-PR split — PR1 lands the criteria
+  as skipped test skeletons plus fixtures (merges green), PR2 implements and unskips. It costs a
+  second review round; never default to it.
+- A task that creates a NEW trust boundary (first payments / auth / admin / uploads / PII code) must
+  add the matching `.github/auto/sensitive-paths.txt` line in the same PR. That makes the PR
+  human-required by construction — the boundary map only ever changes under human eyes.
+- If the plan extends past the auto-merge maturity checkpoint (the stage table in the README), split
+  into TWO manifests: `<slug>-core` (through the checkpoint) and `<slug>-more` (`paused: true`).
+  The checkpoint is a human review — flipping the second manifest on (and, if satisfied,
+  `AUTO_MERGE_ENABLED`) — not a dispatchable task; the dispatcher would hand a task to Claude, who
+  cannot and must not arm autonomy levels.
 
 ## Activation (tell the user this after writing)
 

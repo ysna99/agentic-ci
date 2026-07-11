@@ -15,6 +15,11 @@ name: Codex bridge
 #
 # Safeguards:
 # - Never merges anything.
+# - Fork PRs are never bridged: "@claude fix" must not task Claude with
+#   branch content this repo's collaborators never wrote.
+# - One run per PR at a time (concurrency group below): Codex fans one review
+#   out into many near-simultaneous events, and the marker-comment idempotency
+#   check is read-then-write -- parallel runs would each start a fix round.
 # - Risk = the stricter of the PR body's declared level and a fresh diff
 #   classification run from the DEFAULT-BRANCH classifier (a PR cannot weaken
 #   its own risk).
@@ -36,6 +41,13 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+
+# Serialize per PR (one running + one queued; the queued run sees the marker
+# comment the first one posts and skips). cancel-in-progress stays false so an
+# in-flight decision is never killed mid-write.
+concurrency:
+  group: codex-bridge-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   bridge:
@@ -114,23 +126,20 @@ jobs:
             EVENT_COMMIT=""
           fi
 
-          # PR-level context needed by both trigger paths.
-          read -r BASE_SHA HEAD_SHA < <(gh api "repos/$REPO/pulls/$PR" --jq '"\(.base.sha) \(.head.sha)"')
+          # PR-level context needed by both trigger paths. Reject fork PRs
+          # outright: a fix request would run Claude (contents:write, API key)
+          # against branch content nobody in this repo wrote -- the loop only
+          # ever operates on same-repo claude/* branches.
+          read -r HEAD_SHA HEAD_REPO < <(gh api "repos/$REPO/pulls/$PR" --jq '"\(.head.sha) \(.head.repo.full_name)"')
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "PR #$PR head is from '$HEAD_REPO' (fork); bridge only serves same-repo PRs."
+            exit 0
+          fi
 
           # Effective risk = stricter of (body-declared) and (fresh diff classification
           # via the DEFAULT-BRANCH classifier). A hand-edited body can't talk it down.
-          PR_BODY="$(gh pr view "$PR" -R "$REPO" --json body --jq '.body' || true)"
-          BODY_RISK="$(printf '%s' "$PR_BODY" \
-            | grep -ioE 'risk level:[[:space:]]*`?(simple|complex|human-required)`?' \
-            | head -n 1 | grep -ioE '(simple|complex|human-required)' \
-            | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
-          DIFF_RISK="human-required"
-          if [ -f .github/scripts/classify-risk.sh ]; then
-            DIFF_RISK="$(bash .github/scripts/classify-risk.sh "$BASE_SHA" "$HEAD_SHA" || echo human-required)"
-          fi
-          rank() { case "$1" in human-required) echo 3;; complex) echo 2;; simple) echo 1;; *) echo 0;; esac; }
-          if [ "$(rank "$DIFF_RISK")" -ge "$(rank "$BODY_RISK")" ]; then RISK="$DIFF_RISK"; else RISK="$BODY_RISK"; fi
-          echo "Risk: body='${BODY_RISK:-<none>}' diff='$DIFF_RISK' -> effective='$RISK'"
+          RISK="$(bash .github/scripts/effective-risk.sh "$PR" || echo human-required)"
+          echo "Effective risk: '$RISK'"
 
           # Opt-in BOUND TO THE EXACT HEAD COMMIT: a trusted human (OWNER/MEMBER/
           # COLLABORATOR, not a bot) commented "@claude allow-ai-fix <head-sha>" on the
@@ -168,6 +177,10 @@ jobs:
           # comments carry a commit_id we can bind to HEAD_SHA (issue-comment summaries do
           # not, so they don't count). This gates the human opt-in path: a human may only
           # authorize fixing findings that actually exist for this exact commit.
+          # DELIBERATE ASYMMETRY: inline comments count with NO keyword filter --
+          # Codex only leaves P0/P1 findings inline, so existence on the head is
+          # the signal. Don't "align" this with the keyword regex above; that one
+          # only classifies the TRIGGERING event.
           codex_flagged_head() {
             local n
             n="$( {
@@ -223,7 +236,11 @@ jobs:
           # the same GitHub-derived-state model as the auto-task dispatcher.
           MAX_ROUNDS="${MAX_FIX_ROUNDS:-3}"
           ALL="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[].body' 2>/dev/null || true)"
-          ROUNDS="$(printf '%s' "$ALL" | grep -c 'codex-bridge-fix' || true)"
+          # Count DISTINCT head=/round= markers, not raw occurrences: a human
+          # quote-reply of a fix comment copies the invisible marker verbatim
+          # and must not burn a round.
+          MARKERS="$(printf '%s' "$ALL" | grep -oE 'codex-bridge-fix head=[0-9a-f]+ round=[0-9]+' || true)"
+          ROUNDS="$(printf '%s\n' "$MARKERS" | sort -u | grep -c 'codex-bridge-fix' || true)"
 
           # Idempotency: already asked for a fix on THIS exact head? (several Codex inline
           # comments on one commit must not each start a round).

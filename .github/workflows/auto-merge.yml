@@ -1,16 +1,23 @@
 name: Auto-merge (graduated autonomy)
 
 # Closes the loop for LOW-RISK PRs only. Merges a PR automatically when ALL hold:
+#   - the PR is open, not conflicting, and its head branch lives in THIS repo
+#     (fork PRs always wait for a human, whatever their risk)
 #   - effective risk == simple, RECOMPUTED from the default-branch classifier
 #     (a label is NOT trusted: Claude holds pull-requests:write and could self-label)
-#   - the Codex app has APPROVED the current head commit
-#   - every check is green (gh pr checks passes)
-#   - the PR is open, not a draft, and not conflicting
+#   - the LATEST Codex review on the current head commit is APPROVED
+#   - every REQUIRED check is green (gh pr checks --required)
+# A draft PR that passes every gate is marked ready and merged (claude.yml always
+# opens drafts and nothing else undrafts them). The merge is bound to the exact
+# head commit the gates validated (--match-head-commit): a push landing
+# mid-evaluation fails the merge instead of riding a stale approval.
 # complex / human-required PRs are never auto-merged; a human still merges those.
 #
 # OFF BY DEFAULT. Enable with repo variable AUTO_MERGE_ENABLED=true.
 # Prereqs: branch protection on the default branch with your CI (tsc/lint/test) as
-# REQUIRED checks, and the merging identity (CLAUDE_PR_PAT) permitted to merge.
+# REQUIRED checks, "Do not allow bypassing the above settings" enabled (the PAT
+# owner is usually an admin, and the merge API lets admins past red required
+# checks otherwise), and the merging identity (CLAUDE_PR_PAT) permitted to merge.
 on:
   pull_request_review:
     types: [submitted]
@@ -56,41 +63,57 @@ jobs:
           [ -z "${GH_TOKEN:-}" ] && { echo "CLAUDE_PR_PAT not set; skipping."; exit 0; }
           CODEX_BOT="${CODEX_BOT:-chatgpt-codex-connector[bot]}"
 
-          # Resolve the PR number across the trigger types.
+          # Resolve the PR number across the trigger types. ".[0].number // empty":
+          # a commit with no associated PR (every direct push's check_suite) must
+          # yield an empty string, not the literal "null".
           PR="${REVIEW_PR:-${DISPATCH_PR:-}}"
           if [ -z "$PR" ] && [ -n "${CHECK_SHA:-}" ]; then
-            PR="$(gh api "repos/$REPO/commits/$CHECK_SHA/pulls" --jq '.[0].number' 2>/dev/null || true)"
+            PR="$(gh api "repos/$REPO/commits/$CHECK_SHA/pulls" --jq '.[0].number // empty' 2>/dev/null || true)"
           fi
           [ -z "$PR" ] && { echo "No PR to evaluate."; exit 0; }
 
-          # PR must be open, not a draft, not conflicting.
-          read -r STATE DRAFT MERGEABLE HEAD_SHA BASE_SHA < <(gh api "repos/$REPO/pulls/$PR" \
-            --jq '"\(.state) \(.draft) \(.mergeable_state) \(.head.sha) \(.base.sha)"')
+          # PR must be open, not conflicting, and from a branch in THIS repo:
+          # the design assumes the author is the Claude loop, so a fork PR
+          # (drive-by author) always waits for a human, whatever its risk.
+          read -r STATE DRAFT MERGEABLE HEAD_SHA HEAD_REPO < <(gh api "repos/$REPO/pulls/$PR" \
+            --jq '"\(.state) \(.draft) \(.mergeable_state) \(.head.sha) \(.head.repo.full_name)"')
           [ "$STATE" = "open" ]  || { echo "PR #$PR not open ($STATE)."; exit 0; }
-          [ "$DRAFT" = "false" ] || { echo "PR #$PR is a draft."; exit 0; }
+          [ "$HEAD_REPO" = "$REPO" ] || { echo "PR #$PR head is from '$HEAD_REPO' (fork); a human merges this."; exit 0; }
           [ "$MERGEABLE" != "dirty" ] || { echo "PR #$PR has conflicts."; exit 0; }
 
-          # Gate 1: effective risk == simple, recomputed (never label-trusted).
-          PR_BODY="$(gh pr view "$PR" -R "$REPO" --json body --jq '.body' || true)"
-          BODY_RISK="$(printf '%s' "$PR_BODY" \
-            | grep -ioE 'risk level:[[:space:]]*`?(simple|complex|human-required)`?' \
-            | head -1 | grep -ioE '(simple|complex|human-required)' | head -1 | tr '[:upper:]' '[:lower:]' || true)"
-          DIFF_RISK="human-required"
-          [ -f .github/scripts/classify-risk.sh ] && \
-            DIFF_RISK="$(bash .github/scripts/classify-risk.sh "$BASE_SHA" "$HEAD_SHA" || echo human-required)"
-          rank() { case "$1" in human-required) echo 3;; complex) echo 2;; simple) echo 1;; *) echo 0;; esac; }
-          if [ "$(rank "$DIFF_RISK")" -ge "$(rank "$BODY_RISK")" ]; then RISK="$DIFF_RISK"; else RISK="$BODY_RISK"; fi
+          # Gate 1: effective risk == simple, recomputed via the default-branch
+          # classifier (never label-trusted).
+          RISK="$(bash .github/scripts/effective-risk.sh "$PR" || echo human-required)"
           [ "$RISK" = "simple" ] || { echo "PR #$PR risk='$RISK' (not simple); a human merges this."; exit 0; }
 
-          # Gate 2: Codex APPROVED the CURRENT head (stale approvals from before a push don't count).
-          APPROVED="$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq \
-            '[ .[] | select(.user.login=="'"$CODEX_BOT"'" and .commit_id=="'"$HEAD_SHA"'" and (.state|ascii_upcase=="APPROVED")) ] | length')"
-          [ "${APPROVED:-0}" -gt 0 ] || { echo "No Codex approval on head ${HEAD_SHA:0:12}; waiting."; exit 0; }
+          # Gate 2: the LATEST Codex review on the CURRENT head is APPROVED.
+          # "Some approval exists on this head" is not enough: Codex can re-review
+          # the same commit (it's an LLM; re-runs differ) and request changes AFTER
+          # approving -- the newer verdict must win. Reviews are returned in
+          # submission order, so take the last one bound to this head.
+          LAST_STATE="$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq \
+            '.[] | select(.user.login=="'"$CODEX_BOT"'" and .commit_id=="'"$HEAD_SHA"'") | .state' \
+            | tail -n 1 | tr '[:lower:]' '[:upper:]' || true)"
+          [ "$LAST_STATE" = "APPROVED" ] || { echo "Latest Codex review on head ${HEAD_SHA:0:12} is '${LAST_STATE:-<none>}' (need APPROVED); waiting."; exit 0; }
 
-          # Gate 3: all checks green (gh pr checks exits non-zero on any failing OR pending check).
-          if ! gh pr checks "$PR" -R "$REPO" >/dev/null 2>&1; then
-            echo "Checks not all green on PR #$PR; waiting for CI."; exit 0
+          # Gate 3: every REQUIRED check green. --required scopes the gate to the
+          # branch-protection checks (the load-bearing CI): auxiliary event-driven
+          # runs (this workflow, the bridge) also attach check runs to the head,
+          # and one transient red auxiliary run must not block this head forever.
+          if ! gh pr checks "$PR" -R "$REPO" --required >/dev/null 2>&1; then
+            echo "Required checks not all green on PR #$PR; waiting for CI."; exit 0
           fi
 
-          echo "PR #$PR: simple + Codex-approved on head ${HEAD_SHA:0:12} + checks green -> merging."
-          gh pr merge "$PR" -R "$REPO" --squash --delete-branch
+          # All gates passed. claude.yml always opens PRs as drafts and nothing
+          # else undrafts them, so flipping ready here IS the arming step for the
+          # simple path -- without it auto-merge could never fire.
+          if [ "$DRAFT" = "true" ]; then
+            echo "PR #$PR passed all gates while draft; marking ready for review."
+            gh pr ready "$PR" -R "$REPO"
+          fi
+
+          # --match-head-commit: merge ONLY if the head is still the exact commit
+          # the gates validated -- a push landing mid-evaluation (a fix round, a
+          # human commit) fails the merge instead of riding a stale approval.
+          echo "PR #$PR: simple + Codex-approved on head ${HEAD_SHA:0:12} + required checks green -> merging."
+          gh pr merge "$PR" -R "$REPO" --squash --delete-branch --match-head-commit "$HEAD_SHA"

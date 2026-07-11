@@ -49,7 +49,15 @@ FILES="$(printf '%s' "$CMP" | jq -r '.files[] | .filename, (.previous_filename /
 SENSITIVE_BASE='(^\.github/|(^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements\.txt|Pipfile(\.lock)?|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$|(^|/)\.env|secret|auth|jwt|admin|payment|migration)'
 EXTRA="$(sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' "$(dirname "$0")/../auto/sensitive-paths.txt" 2>/dev/null | awk 'NF' | paste -sd'|' - || true)"
 if [ -n "$EXTRA" ]; then SENSITIVE="(${SENSITIVE_BASE}|${EXTRA})"; else SENSITIVE="$SENSITIVE_BASE"; fi
-if printf '%s\n' "$FILES" | grep -qiE "$SENSITIVE"; then
+# grep rc: 0=match, 1=no match, >=2=error (e.g. a malformed regex line in
+# sensitive-paths.txt). An error must fail CLOSED: inside a bare `if` it would
+# read as "no match" and one bad config line would silently disable the whole
+# sensitive check, built-in BASE patterns included.
+set +e
+printf '%s\n' "$FILES" | grep -qiE "$SENSITIVE"
+GREP_RC=$?
+set -e
+if [ "$GREP_RC" -ne 1 ]; then
   echo "human-required"; exit 0
 fi
 

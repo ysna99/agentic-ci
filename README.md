@@ -67,8 +67,11 @@ branch protection. When phase-0 produces those, hand off to this loop.
 6. Install the planning skill: copy `skills/split-task/` to
    `~/.claude/skills/split-task/`.
 7. Branch protection on the default branch with CI (build/lint/test) as REQUIRED
-   checks. Mandatory before enabling auto-merge -- no human reviews low-risk PRs,
-   so the tests are the gate.
+   checks, and "Do not allow bypassing the above settings" enabled -- the PAT
+   owner is usually an admin, and without it the merge API lets admins past red
+   required checks. Mandatory before enabling auto-merge -- no human reviews
+   low-risk PRs, so the tests are the gate (auto-merge evaluates exactly the
+   REQUIRED checks, via `gh pr checks --required`).
 
 ## What's inside
 
@@ -78,6 +81,8 @@ branch protection. When phase-0 produces those, hand off to this loop.
 - `workflows/task-dispatcher.yml` -- stateless multi-task chain (one PR at a time)
 - `workflows/auto-merge.yml` -- auto-merge low-risk PRs (OFF by default)
 - `scripts/classify-risk.sh` -- deterministic risk from the diff
+- `scripts/effective-risk.sh` -- stricter-of(body, diff) risk; the one source the
+  bridge, the label, and auto-merge all gate on
 - `scripts/dispatch-tasks.sh` -- dispatcher logic (stateless, GitHub-derived state)
 - `auto/sensitive-paths.txt` -- per-repo trust boundaries (you edit this)
 - `auto-tasks/README.md` -- manifest schema for multi-task work
@@ -88,6 +93,17 @@ branch protection. When phase-0 produces those, hand off to this loop.
 - `classify-risk.sh` and `sensitive-paths.txt` are always read from the DEFAULT
   branch, never a PR checkout -- a PR must not be able to reclassify itself.
 - Effective risk is always RECOMPUTED from the diff, never trusted from a label
-  (Claude can set labels). Auto-merge and the bridge both recompute.
-- `classify-risk.sh` fails safe to human-required on an empty/unknown diff or a
-  300-file compare cap.
+  (Claude can set labels). Auto-merge and the bridge both recompute, through the
+  shared `effective-risk.sh`.
+- `classify-risk.sh` fails safe to human-required on an empty/unknown diff, a
+  300-file compare cap, or a malformed regex in `sensitive-paths.txt` (a config
+  typo must not silently disable the sensitive check).
+- Fork PRs are excluded from both the bridge and auto-merge: the loop only
+  operates on same-repo `claude/*` branches, so a drive-by author can never
+  reach the automated fix or merge paths.
+- Auto-merge requires the LATEST Codex review on the exact current head to be
+  APPROVED, and merges with `--match-head-commit` -- a push landing between
+  evaluation and merge fails the merge instead of sneaking in unreviewed.
+- Claude's PRs stay drafts until auto-merge's gates all pass (simple + approved
+  + required checks green); passing them is what flips the PR ready and merges
+  it. Every other PR waits for a human to undraft and merge.

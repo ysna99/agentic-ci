@@ -79,12 +79,14 @@ for MANIFEST in $MANIFEST_GLOB; do
     else STATE[$ID]=IN_FLIGHT; INFLIGHT=$((INFLIGHT+1)); fi
   done
 
-  # A human closed a task issue without a merged PR -> stop the chain.
+  # A human closed a task issue without a merged PR -> stop dispatching.
+  # Deliberately halts EVERY manifest, not just this slug: a human said "no"
+  # somewhere, and we don't barrel past that anywhere.
   if [ -n "$BLOCKED_N" ]; then
-    echo "Task issue #$BLOCKED_N closed without a merged PR; stopping chain for $SLUG."
+    echo "Task issue #$BLOCKED_N closed without a merged PR; halting ALL dispatching until resolved."
     MARK="auto-task-dispatcher: chain stopped"
     if ! gh issue view "$BLOCKED_N" -R "$REPO" --json comments --jq '.comments[].body' 2>/dev/null | grep -qF "$MARK"; then
-      gh issue comment "$BLOCKED_N" -R "$REPO" --body "$MARK for \`$SLUG\`. This task issue was closed without a merged \`claude/issue-$BLOCKED_N-*\` PR, so it is treated as blocked and no further tasks will be opened. Complete or reopen this task (or set \`\"paused\": true\`), then re-run the dispatcher to resume."
+      gh issue comment "$BLOCKED_N" -R "$REPO" --body "$MARK for \`$SLUG\`. This task issue was closed without a merged \`claude/issue-$BLOCKED_N-*\` PR, so it is treated as blocked and no further tasks will be opened -- in ANY manifest -- until it is resolved. Complete or reopen this task (or set \`\"paused\": true\`), then re-run the dispatcher to resume."
     fi
     exit 0
   fi

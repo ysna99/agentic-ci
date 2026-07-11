@@ -16,10 +16,12 @@ EOF
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH"
 
-# Two script copies with the right relative layout (script reads ../auto/...):
-#  WITHCFG has a sensitive-paths.txt with a repo-specific pattern; NOCFG has none.
-for d in WITHCFG NOCFG; do mkdir -p "$TMP/$d/scripts" "$TMP/$d/auto"; cp "$SCRIPT" "$TMP/$d/scripts/"; done
+# Script copies with the right relative layout (script reads ../auto/...):
+#  WITHCFG has a sensitive-paths.txt with a repo-specific pattern; NOCFG has
+#  none; BADCFG has a malformed regex line (must fail closed, not fall through).
+for d in WITHCFG NOCFG BADCFG; do mkdir -p "$TMP/$d/scripts" "$TMP/$d/auto"; cp "$SCRIPT" "$TMP/$d/scripts/"; done
 printf '(^|/)src/app/api/   # server API routes\n# a comment line\n' >"$TMP/WITHCFG/auto/sensitive-paths.txt"
+printf '(^|/src/api   # malformed: unbalanced paren\n' >"$TMP/BADCFG/auto/sensitive-paths.txt"
 
 # build a compare-JSON fixture from "path:add:del" specs
 fixture() { local out='{"files":['; local first=1 p; for spec in "$@"; do
@@ -49,5 +51,8 @@ check "complex: >5 files"         WITHCFG complex        "docs/a.md:1:0" "docs/b
 check "complex: >150 lines"       WITHCFG complex        "src/lib/util.ts:200:0"
 # design proof: without the repo config, the api boundary is NOT protected
 check "no-config: api -> simple"  NOCFG   simple         "src/app/api/route.ts:2:0"
+# fail closed: a malformed EXTRA regex (grep error) must not silently disable
+# the sensitive check -- an innocuous file still classifies human-required
+check "bad-config: fail closed"   BADCFG  human-required "README.md:2:0"
 
 echo; [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

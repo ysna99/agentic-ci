@@ -62,11 +62,15 @@ on each issue it opens (plus an `<!-- auto-task slug=... id=... -->` marker in t
 4. Each issue runs the normal build loop (draft PR, `@codex review`, bridge).
    A human reviews and merges every PR; **nothing is auto-merged**.
 5. If a task issue is **closed without** a merged `claude/issue-<N>-*` PR, the
-   dispatcher treats it as **BLOCKED**, comments once, and **stops the chain**.
+   dispatcher treats it as **BLOCKED**, comments once, and **stops the chain**
+   (all manifests hold, not just this one, until it is resolved).
 
 ## Controls
 
 - **Stop:** set `"paused": true`, or set repo variable `AUTO_TASKS_ENABLED=false`.
+- **Reject a task:** close the task **issue** (not just its PR). A closed PR with
+  an open issue keeps the task IN_FLIGHT and the chain just waits; closing the
+  issue is the "no" signal the dispatcher acts on.
 - **Resume after a block:** complete/reopen the blocked task, then re-run the
   workflow (`gh workflow run ...`) or merge any PR to re-trigger.
 - Only one manifest progresses at a time (the first non-paused one with work left).

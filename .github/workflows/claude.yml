@@ -14,6 +14,13 @@ on:
   issues:
     types: [opened, assigned]
 
+# Serialize per conversation: concurrent runs for the same issue/PR would push
+# the same branch. One running + one queued; a third rapid-fire trigger replaces
+# the queued one (acceptable -- the queued run re-reads the conversation anyway).
+concurrency:
+  group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   claude:
     # Require "@claude" AND a trusted actor; gates out drive-by non-collaborators.
@@ -117,3 +124,20 @@ jobs:
           echo "Opened draft PR: $URL"
           # Ask the official Codex GitHub app to review (works even while draft).
           gh pr comment "$URL" --body "@codex review"
+
+      # A failed run must leave a trace where the work item lives: the task
+      # dispatcher treats an open task issue with no PR as IN_FLIGHT forever, so
+      # a silent failure (API outage, action error) stalls the whole chain with
+      # the only signal buried in the Actions tab. The body deliberately avoids
+      # the "@claude" trigger phrase; github-actions[bot] is gated out anyway.
+      - name: Report failure on the triggering issue/PR
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.issue.number || github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [ -n "${NUM:-}" ] || { echo "No issue/PR to report to."; exit 0; }
+          gh issue comment "$NUM" -R "$REPO" --body "Claude Code run failed: $RUN_URL -- no branch or PR may have been produced. Check the log, then re-trigger by commenting on this thread. <!-- claude-run-failed -->" || true

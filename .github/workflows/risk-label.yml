@@ -28,10 +28,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Passed via env (never inlined into the script) to avoid injection.
-          BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
 
@@ -40,29 +36,16 @@ jobs:
           gh label create complex        -R "$REPO" --color fbca04 --description "Non-trivial logic; deeper review needed" --force >/dev/null 2>&1 || true
           gh label create human-required -R "$REPO" --color b60205 --description "Sensitive area; requires human review, no auto-approve" --force >/dev/null 2>&1 || true
 
-          # Risk declared in the PR body (case-insensitive, optional backticks).
-          BODY_RISK="$(printf '%s' "$BODY" \
-            | grep -ioE 'risk level:[[:space:]]*`?(simple|complex|human-required)`?' \
-            | head -n 1 \
-            | grep -ioE '(simple|complex|human-required)' \
-            | head -n 1 \
-            | tr '[:upper:]' '[:lower:]' || true)"
-
-          # Risk classified from the diff (fall back to body-only if script absent).
-          DIFF_RISK=""
-          if [ -f .github/scripts/classify-risk.sh ]; then
-            DIFF_RISK="$(bash .github/scripts/classify-risk.sh "$BASE_SHA" "$HEAD_SHA" || true)"
-          fi
-
-          # Effective risk = the stricter of the two.
-          rank() { case "$1" in human-required) echo 3;; complex) echo 2;; simple) echo 1;; *) echo 0;; esac; }
-          if [ "$(rank "$DIFF_RISK")" -ge "$(rank "$BODY_RISK")" ]; then RISK="$DIFF_RISK"; else RISK="$BODY_RISK"; fi
+          # Effective risk (stricter of body-declared and fresh diff classification),
+          # from the SAME script the bridge and auto-merge enforce -- one source,
+          # so the visible label can't drift from the actual gates.
+          RISK="$(bash .github/scripts/effective-risk.sh "$PR" || true)"
 
           if [ -z "${RISK:-}" ]; then
-            echo "No risk determinable (no body line, no diff); leaving labels unchanged."
+            echo "No risk determinable; leaving labels unchanged."
             exit 0
           fi
-          echo "Effective risk: body='${BODY_RISK:-<none>}' diff='${DIFF_RISK:-<none>}' -> '$RISK'"
+          echo "Effective risk: '$RISK'"
 
           # Remove any stale risk labels, then apply the effective one.
           for l in simple complex human-required; do

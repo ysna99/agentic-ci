@@ -89,8 +89,9 @@ listed criteria, and does the code pass them?
 9. Arm and verify: `bash bootstrap/protect.sh <owner/repo>` from the
    agentic-ci checkout. It sets branch protection (required check `checks`,
    admins cannot bypass) and `MAX_FIX_ROUNDS`, then verifies the preconditions
-   and prints what only a human can finish: the two secrets and the Codex app
-   install. Re-run with `--verify` after those until it prints
+   and prints what only a human can finish: the two secrets (`CLAUDE_PR_PAT`
+   plus ONE Claude auth secret: `CLAUDE_CODE_OAUTH_TOKEN` for a Pro/Max
+   subscription, or `ANTHROPIC_API_KEY`) and the Codex app install. Re-run with `--verify` after those until it prints
    `ALL PRECONDITIONS PASS`. That line is the handoff: the repo now IS a
    brownfield repo, and nothing downstream is greenfield-specific.
 10. Plan the work: run `/split-task` on `docs/spec.md`. It will choose the

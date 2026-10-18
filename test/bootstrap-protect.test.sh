@@ -33,8 +33,8 @@ case "$P" in
   repos/o/r/contents/*)
     out="{\"name\":\"$(basename "$P")\"}" ;;
   repos/o/r/actions/secrets)
-    if [ "${T_MISS_SECRET:-}" = "1" ]; then out='{"secrets":[{"name":"ANTHROPIC_API_KEY"}]}'
-    else out='{"secrets":[{"name":"ANTHROPIC_API_KEY"},{"name":"CLAUDE_PR_PAT"}]}'; fi ;;
+    # T_SECRETS: space-separated secret names present (default: API key + PAT).
+    out="$(printf '%s\n' ${T_SECRETS:-ANTHROPIC_API_KEY CLAUDE_PR_PAT} | jq -R '{name: .}' | jq -s '{secrets: .}')" ;;
   repos/o/r/actions/variables)
     out='{"variables":[{"name":"MAX_FIX_ROUNDS"}]}' ;;
   repos/o/r)
@@ -61,12 +61,34 @@ else
   echo "FAIL  verify: boundary lines counted"; fails=$((fails+1))
 fi
 # A missing secret -> exit 1 and a FAIL line naming it with the fix command.
-if out="$(T_MISS_SECRET=1 bash "$ROOT/bootstrap/protect.sh" o/r --verify 2>&1)"; then
+if out="$(T_SECRETS="ANTHROPIC_API_KEY" bash "$ROOT/bootstrap/protect.sh" o/r --verify 2>&1)"; then
   echo "FAIL  verify: missing secret should exit non-zero"; fails=$((fails+1))
 elif printf '%s' "$out" | grep -q 'FAIL  secret CLAUDE_PR_PAT'; then
   echo "PASS  verify: missing secret detected"
 else
   echo "FAIL  verify: missing secret detected"; printf '%s\n' "$out"; fails=$((fails+1))
+fi
+# Subscription token alone satisfies Claude auth.
+if out="$(T_SECRETS="CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PR_PAT" bash "$ROOT/bootstrap/protect.sh" o/r --verify 2>&1)" \
+   && printf '%s' "$out" | grep -q 'PASS  Claude auth: CLAUDE_CODE_OAUTH_TOKEN'; then
+  echo "PASS  verify: subscription token accepted"
+else
+  echo "FAIL  verify: subscription token accepted"; printf '%s\n' "$out"; fails=$((fails+1))
+fi
+# No Claude auth secret -> exit 1 and a FAIL line naming both options.
+if out="$(T_SECRETS="CLAUDE_PR_PAT" bash "$ROOT/bootstrap/protect.sh" o/r --verify 2>&1)"; then
+  echo "FAIL  verify: missing Claude auth should exit non-zero"; fails=$((fails+1))
+elif printf '%s' "$out" | grep -q 'FAIL  Claude auth secret.*CLAUDE_CODE_OAUTH_TOKEN.*ANTHROPIC_API_KEY'; then
+  echo "PASS  verify: missing Claude auth detected"
+else
+  echo "FAIL  verify: missing Claude auth detected"; printf '%s\n' "$out"; fails=$((fails+1))
+fi
+# Both set -> still passes, but warns that the API key wins (billed).
+if out="$(T_SECRETS="ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PR_PAT" bash "$ROOT/bootstrap/protect.sh" o/r --verify 2>&1)" \
+   && printf '%s' "$out" | grep -q 'both secrets set -- ANTHROPIC_API_KEY takes precedence'; then
+  echo "PASS  verify: both auth secrets flagged"
+else
+  echo "FAIL  verify: both auth secrets flagged"; printf '%s\n' "$out"; fails=$((fails+1))
 fi
 
 echo; [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

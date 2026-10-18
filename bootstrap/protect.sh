@@ -89,9 +89,19 @@ fi
 
 # Secrets and variables the workflows need.
 SECRETS="$(gh api "repos/$R/actions/secrets" --jq '.secrets[].name' 2>/dev/null || true)"
-for s in ANTHROPIC_API_KEY CLAUDE_PR_PAT; do
-  if printf '%s\n' "$SECRETS" | grep -qx "$s"; then ok "secret $s"; else bad "secret $s   (gh secret set $s -R $R)"; fi
-done
+has_secret() { printf '%s\n' "$SECRETS" | grep -qx "$1"; }
+if has_secret CLAUDE_PR_PAT; then ok "secret CLAUDE_PR_PAT"; else bad "secret CLAUDE_PR_PAT   (gh secret set CLAUDE_PR_PAT -R $R)"; fi
+# Claude auth: exactly one is needed. Both set -> the API key wins and every
+# run is billed per token, which is rarely what a subscription user intended.
+if has_secret CLAUDE_CODE_OAUTH_TOKEN && has_secret ANTHROPIC_API_KEY; then
+  ok "Claude auth: both secrets set -- ANTHROPIC_API_KEY takes precedence (billed per token); delete it to use the subscription"
+elif has_secret CLAUDE_CODE_OAUTH_TOKEN; then
+  ok "Claude auth: CLAUDE_CODE_OAUTH_TOKEN (subscription usage limits, shared with interactive use)"
+elif has_secret ANTHROPIC_API_KEY; then
+  ok "Claude auth: ANTHROPIC_API_KEY (billed per token)"
+else
+  bad "Claude auth secret   (subscription: claude setup-token, then gh secret set CLAUDE_CODE_OAUTH_TOKEN -R $R; or gh secret set ANTHROPIC_API_KEY -R $R)"
+fi
 VARS="$(gh api "repos/$R/actions/variables" --jq '.variables[].name' 2>/dev/null || true)"
 if printf '%s\n' "$VARS" | grep -qx MAX_FIX_ROUNDS; then ok "variable MAX_FIX_ROUNDS"; else bad "variable MAX_FIX_ROUNDS"; fi
 

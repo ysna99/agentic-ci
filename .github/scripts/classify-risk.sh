@@ -23,6 +23,9 @@ HEAD="${2:?head ref/sha required}"
 enc() { jq -rn --arg s "$1" '$s | @uri'; }
 CMP="$(gh api "repos/${REPO}/compare/$(enc "$BASE")...$(enc "$HEAD")" 2>/dev/null || true)"
 [ -n "$CMP" ] || { echo "human-required"; exit 0; }
+# An API error (e.g. 404 for a ref that does not exist) comes back as a JSON
+# body without a .files array; treat it like an unknown diff, not a crash.
+printf '%s' "$CMP" | jq -e '.files | type == "array"' >/dev/null 2>&1 || { echo "human-required"; exit 0; }
 
 # The compare endpoint returns the changed-file list only on the first page and
 # caps it at 300 files for the whole comparison, so a larger diff could hide a

@@ -62,6 +62,11 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Extra CLI flags from repo variable CLAUDE_ARGS (empty = action
+          # defaults). The default tool set has no build/test commands, so a
+          # repo whose CLAUDE.md says "run the checks" must allow them here, e.g.
+          #   --allowedTools "Bash(npm test:*),Bash(npx tsc:*)"
+          claude_args: ${{ vars.CLAUDE_ARGS }}
 
       # Open a draft PR with a PAT (so the risk-label workflow fires; PRs opened
       # by the default GITHUB_TOKEN do not trigger other workflows), then ask the
@@ -102,6 +107,12 @@ jobs:
 
           if [ -z "${BRANCH:-}" ]; then
             echo "No branch was created and this is not a PR comment; nothing to open."
+            exit 0
+          fi
+          # Claude may name a branch yet push nothing (e.g. it stopped because it
+          # could not verify its work). That is a reported outcome, not a failure.
+          if ! git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH was not pushed; nothing to open. See Claude's comment on the issue."
             exit 0
           fi
 

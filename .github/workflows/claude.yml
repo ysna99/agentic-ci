@@ -55,8 +55,13 @@ jobs:
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
+        # Set exactly ONE of these secrets. CLAUDE_CODE_OAUTH_TOKEN (from
+        # `claude setup-token`, Pro/Max) draws on the subscription's usage limits,
+        # shared with your interactive Claude use; ANTHROPIC_API_KEY bills per
+        # token. If both are set the API key wins, so the run is billed.
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # Open a draft PR with a PAT (so the risk-label workflow fires; PRs opened
       # by the default GITHUB_TOKEN do not trigger other workflows), then ask the

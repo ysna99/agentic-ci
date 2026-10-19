@@ -87,7 +87,16 @@ Start from scratch:
    (one extended-regex fragment per line; `#` comments ignored). The universal
    boundaries are already built in -- add only repo-specific paths.
 3. Secrets: `CLAUDE_PR_PAT` (fine-grained PAT: Contents RW, Pull requests RW,
-   Issues RW, Metadata R; no workflow scope) and `ANTHROPIC_API_KEY`.
+   Issues RW, Metadata R; no workflow scope) and ONE Claude auth secret:
+   - `CLAUDE_CODE_OAUTH_TOKEN` (Pro/Max subscription; generate with
+     `claude setup-token`, valid one year -- re-generate and replace the secret
+     before it expires). Runs draw on the same usage limits as your
+     interactive Claude use -- a busy loop can exhaust them, and a run that hits
+     the limit fails and leaves a failure comment on the issue; re-trigger after
+     the limit resets.
+   - or `ANTHROPIC_API_KEY` (billed per token; set a spend limit in the Console).
+
+   Do not set both: the API key takes precedence, so every run would be billed.
 4. Repo variables (all optional, safe defaults):
    - `AUTO_TASKS_ENABLED=true` to arm the multi-task dispatcher
    - `AUTO_MERGE_ENABLED=true` to arm auto-merge (requires step 7)

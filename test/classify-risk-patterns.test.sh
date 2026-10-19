@@ -54,5 +54,9 @@ check "no-config: api -> simple"  NOCFG   simple         "src/app/api/route.ts:2
 # fail closed: a malformed EXTRA regex (grep error) must not silently disable
 # the sensitive check -- an innocuous file still classifies human-required
 check "bad-config: fail closed"   BADCFG  human-required "README.md:2:0"
+# fail closed: a compare API error body (missing ref -> 404) has no .files
+printf '%s' '{"message":"Not Found","status":"404"}' >"$TMP/fix.json"
+got="$(GH_FIXTURE="$TMP/fix.json" REPO=o/r GH_TOKEN=t bash "$TMP/WITHCFG/scripts/classify-risk.sh" base head)"
+if [ "$got" = "human-required" ]; then echo "PASS  api-error: fail closed ($got)"; else echo "FAIL  api-error: want=human-required got=$got"; fails=$((fails+1)); fi
 
 echo; [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

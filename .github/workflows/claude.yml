@@ -111,7 +111,10 @@ jobs:
           fi
           # Claude may name a branch yet push nothing (e.g. it stopped because it
           # could not verify its work). That is a reported outcome, not a failure.
-          if ! git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+          # Ask the API with the PAT: the checkout's git credentials are not usable
+          # here (the action revokes its app token at the end of its step), so
+          # `git ls-remote` reports even a pushed branch as missing.
+          if ! gh api "repos/${REPO}/branches/$(jq -rn --arg s "$BRANCH" '$s | @uri')" >/dev/null 2>&1; then
             echo "Branch $BRANCH was not pushed; nothing to open. See Claude's comment on the issue."
             exit 0
           fi
